@@ -63,10 +63,25 @@ func GetProcessStats(processName string) map[string]string {
 	return m
 }
 
-func main() {
+func MonitorProcessStats(processName string) {
+	utimeCurrent := 0
+	ktimeCurrent := 0
+	utimePrevious := 0
+	ktimePrevious := 0
+	cpuLastSecond := 0
 	for {
+		utimePrevious = utimeCurrent
+		ktimePrevious = ktimeCurrent
 		m := GetProcessStats("python2")
-		fmt.Println("utime:", m["utime"], "ktime:", m["ktime"], "vsize:", m["vsizem"], "rsizem", m["rsizem"])
+		utimeCurrent, _ = strconv.Atoi(m["utime"])
+		ktimeCurrent, _ = strconv.Atoi(m["ktime"])
+		cpuLastSecond = (utimeCurrent + ktimeCurrent) - (utimePrevious + ktimePrevious)
+		fmt.Println("utime:", m["utime"], "ktime:", m["ktime"], "vsize:", m["vsizem"], "rsizem", m["rsizem"], "cpu last sec", cpuLastSecond)
 		time.Sleep(1 * time.Second)
+
 	}
+}
+
+func main() {
+	MonitorProcessStats("python2")
 }
