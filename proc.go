@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"github.com/mitchellh/go-ps"
 	"io/ioutil"
@@ -69,6 +70,7 @@ func MonitorProcessStats(processName string) {
 	utimePrevious := 0
 	ktimePrevious := 0
 	cpuLastSecond := 0
+	fmt.Println("Monitoring stats for", processName)
 	for {
 		utimePrevious = utimeCurrent
 		ktimePrevious = ktimeCurrent
@@ -83,5 +85,7 @@ func MonitorProcessStats(processName string) {
 }
 
 func main() {
-	MonitorProcessStats("python2")
+	var name = flag.String("name", "python2", "Process name to monitor.")
+	flag.Parse()
+	MonitorProcessStats(*name)
 }
