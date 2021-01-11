@@ -74,7 +74,7 @@ func MonitorProcessStats(processName string) {
 	for {
 		utimePrevious = utimeCurrent
 		ktimePrevious = ktimeCurrent
-		m := GetProcessStats("python2")
+		m := GetProcessStats(processName)
 		utimeCurrent, _ = strconv.Atoi(m["utime"])
 		ktimeCurrent, _ = strconv.Atoi(m["ktime"])
 		cpuLastSecond = (utimeCurrent + ktimeCurrent) - (utimePrevious + ktimePrevious)
