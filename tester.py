@@ -1,6 +1,7 @@
 import time
 import random
 
+
 x = 0
 y = ""
 for z in xrange(0,100000):
