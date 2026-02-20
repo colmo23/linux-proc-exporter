@@ -1,12 +1,6 @@
 # linux-proc-exporter
 Sample usage:
 ```
-go run src/github.com/colmo23/linux-proc-exporter/proc.go
+ go run main.go -processes containerd,etcd,claude,kube-apiserver
 ```
 
-
-# Installation using legacy $GOPATH method
-```
-cd $GOPATH
-go get github.com/colmo23/linux-proc-exporter
-```
