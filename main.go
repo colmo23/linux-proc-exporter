@@ -16,6 +16,49 @@ import (
 
 const maxSamples = 300
 
+type metricInfo struct {
+	name   string
+	label  string
+	source string
+	notes  string
+}
+
+var allMetrics = []metricInfo{
+	{"cpu", "CPU usage (ticks/sec)", "/proc/<pid>/stat", "delta"},
+	{"rss", "Resident set size (memory pages)", "/proc/<pid>/statm", ""},
+	{"vsize", "Virtual memory size (pages)", "/proc/<pid>/statm", ""},
+	{"threads", "Number of threads", "/proc/<pid>/stat", ""},
+	{"fds", "Open file descriptor count", "/proc/<pid>/fd/", "requires ownership"},
+	{"read_bytes", "Storage bytes read per second", "/proc/<pid>/io", "delta; requires ownership"},
+	{"write_bytes", "Storage bytes written per second", "/proc/<pid>/io", "delta; requires ownership"},
+	{"minflt", "Minor page faults per second", "/proc/<pid>/stat", "delta"},
+	{"majflt", "Major page faults per second", "/proc/<pid>/stat", "delta"},
+	{"ctx_switch", "Context switches per second", "/proc/<pid>/status", "delta"},
+}
+
+func printMetrics() {
+	fmt.Println("Available metrics:")
+	fmt.Printf("  %-12s  %-38s  %-24s  %s\n", "NAME", "DESCRIPTION", "SOURCE", "NOTES")
+	fmt.Printf("  %-12s  %-38s  %-24s  %s\n",
+		"------------", "--------------------------------------", "------------------------", "-----")
+	for _, m := range allMetrics {
+		fmt.Printf("  %-12s  %-38s  %-24s  %s\n", m.name, m.label, m.source, m.notes)
+	}
+}
+
+func metricsHelpText() string {
+	var sb strings.Builder
+	sb.WriteString("Comma-separated list of metrics to display.\nAvailable metrics:\n")
+	for _, m := range allMetrics {
+		line := fmt.Sprintf("  %-12s  %s  (%s)", m.name, m.label, m.source)
+		if m.notes != "" {
+			line += "  [" + m.notes + "]"
+		}
+		sb.WriteString(line + "\n")
+	}
+	return sb.String()
+}
+
 type Sample struct {
 	Timestamp int64            `json:"t"`
 	Values    map[string]int64 `json:"m"`
@@ -373,19 +416,14 @@ func mainPageHandler(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 	processesFlag := flag.String("processes", "python2", "Comma-separated list of process names to monitor.")
-	metricsFlag := flag.String("metrics", "cpu,rss", `Comma-separated list of metrics to display.
-Available metrics:
-  cpu         CPU usage (ticks/sec)                      /proc/<pid>/stat
-  rss         Resident set size (memory pages)           /proc/<pid>/statm
-  vsize       Virtual memory size (pages)                /proc/<pid>/statm
-  threads     Number of threads                          /proc/<pid>/stat
-  fds         Open file descriptor count                 /proc/<pid>/fd/
-  read_bytes  Storage bytes read per second              /proc/<pid>/io  (requires ownership)
-  write_bytes Storage bytes written per second           /proc/<pid>/io  (requires ownership)
-  minflt      Minor page faults per second               /proc/<pid>/stat
-  majflt      Major page faults per second               /proc/<pid>/stat
-  ctx_switch  Context switches per second                /proc/<pid>/status`)
+	metricsFlag := flag.String("metrics", "cpu,rss", metricsHelpText())
+	listMetrics := flag.Bool("list-metrics", false, "Print all available metrics and exit.")
 	flag.Parse()
+
+	if *listMetrics {
+		printMetrics()
+		return
+	}
 
 	names := strings.Split(*processesFlag, ",")
 	for i, n := range names {
