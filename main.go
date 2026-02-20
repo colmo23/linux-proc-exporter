@@ -17,23 +17,27 @@ import (
 const maxSamples = 300
 
 type Sample struct {
-	Timestamp int64 `json:"t"`
-	CPU       int   `json:"cpu"`
-	VSize     int   `json:"vsize"`
-	RSS       int   `json:"rss"`
+	Timestamp int64            `json:"t"`
+	Values    map[string]int64 `json:"m"`
 }
 
 type ProcessStats struct {
 	mu          sync.Mutex
 	samples     []Sample
-	prevCPU     int
+	prevRaw     map[string]int64
 	initialized bool
 }
 
 var (
-	statsMap   = make(map[string]*ProcessStats)
-	statsMapMu sync.RWMutex
+	statsMap        = make(map[string]*ProcessStats)
+	statsMapMu      sync.RWMutex
+	selectedMetrics []string
+	metricsSet      map[string]bool
 )
+
+func hasMetric(name string) bool {
+	return metricsSet[name]
+}
 
 func getProcessPID(processName string) int {
 	procs, _ := gops.Processes()
@@ -52,7 +56,7 @@ func collectOnce(name string, pst *ProcessStats) {
 	if pid == 0 {
 		pst.mu.Lock()
 		pst.initialized = false
-		pst.samples = append(pst.samples, Sample{Timestamp: ts})
+		pst.samples = append(pst.samples, Sample{Timestamp: ts, Values: map[string]int64{}})
 		if len(pst.samples) > maxSamples {
 			pst.samples = pst.samples[len(pst.samples)-maxSamples:]
 		}
@@ -60,42 +64,145 @@ func collectOnce(name string, pst *ProcessStats) {
 		return
 	}
 
-	dat, err := ioutil.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
-	if err != nil {
-		return
+	// Copy previous raw accumulators without holding lock during I/O.
+	pst.mu.Lock()
+	prevRaw := make(map[string]int64, len(pst.prevRaw))
+	for k, v := range pst.prevRaw {
+		prevRaw[k] = v
 	}
-	fields := strings.Fields(string(dat))
-	if len(fields) < 15 {
-		return
-	}
-	utime, _ := strconv.Atoi(fields[13])
-	ktime, _ := strconv.Atoi(fields[14])
-	totalCPU := utime + ktime
+	initialized := pst.initialized
+	pst.mu.Unlock()
 
-	datm, err := ioutil.ReadFile(fmt.Sprintf("/proc/%d/statm", pid))
-	if err != nil {
-		return
+	values := make(map[string]int64)
+	newRaw := make(map[string]int64)
+
+	// /proc/pid/stat — cpu, minflt, majflt, threads
+	if hasMetric("cpu") || hasMetric("minflt") || hasMetric("majflt") || hasMetric("threads") {
+		dat, err := ioutil.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+		if err == nil {
+			fields := strings.Fields(string(dat))
+			if len(fields) >= 20 {
+				if hasMetric("cpu") {
+					utime, _ := strconv.ParseInt(fields[13], 10, 64)
+					ktime, _ := strconv.ParseInt(fields[14], 10, 64)
+					raw := utime + ktime
+					if initialized {
+						values["cpu"] = raw - prevRaw["cpu"]
+					}
+					newRaw["cpu"] = raw
+				}
+				if hasMetric("minflt") {
+					raw, _ := strconv.ParseInt(fields[9], 10, 64)
+					if initialized {
+						values["minflt"] = raw - prevRaw["minflt"]
+					}
+					newRaw["minflt"] = raw
+				}
+				if hasMetric("majflt") {
+					raw, _ := strconv.ParseInt(fields[11], 10, 64)
+					if initialized {
+						values["majflt"] = raw - prevRaw["majflt"]
+					}
+					newRaw["majflt"] = raw
+				}
+				if hasMetric("threads") {
+					v, _ := strconv.ParseInt(fields[19], 10, 64)
+					values["threads"] = v
+				}
+			}
+		}
 	}
-	sm := strings.Fields(string(datm))
-	if len(sm) < 2 {
-		return
+
+	// /proc/pid/statm — vsize, rss
+	if hasMetric("vsize") || hasMetric("rss") {
+		datm, err := ioutil.ReadFile(fmt.Sprintf("/proc/%d/statm", pid))
+		if err == nil {
+			sm := strings.Fields(string(datm))
+			if len(sm) >= 2 {
+				if hasMetric("vsize") {
+					v, _ := strconv.ParseInt(sm[0], 10, 64)
+					values["vsize"] = v
+				}
+				if hasMetric("rss") {
+					v, _ := strconv.ParseInt(sm[1], 10, 64)
+					values["rss"] = v
+				}
+			}
+		}
 	}
-	vsize, _ := strconv.Atoi(sm[0])
-	rss, _ := strconv.Atoi(sm[1])
+
+	// /proc/pid/io — read_bytes, write_bytes (requires process ownership or root)
+	if hasMetric("read_bytes") || hasMetric("write_bytes") {
+		dat, err := ioutil.ReadFile(fmt.Sprintf("/proc/%d/io", pid))
+		if err == nil {
+			for _, line := range strings.Split(string(dat), "\n") {
+				parts := strings.SplitN(strings.TrimSpace(line), ": ", 2)
+				if len(parts) != 2 {
+					continue
+				}
+				val, err := strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 64)
+				if err != nil {
+					continue
+				}
+				switch parts[0] {
+				case "read_bytes":
+					if hasMetric("read_bytes") {
+						if initialized {
+							values["read_bytes"] = val - prevRaw["read_bytes"]
+						}
+						newRaw["read_bytes"] = val
+					}
+				case "write_bytes":
+					if hasMetric("write_bytes") {
+						if initialized {
+							values["write_bytes"] = val - prevRaw["write_bytes"]
+						}
+						newRaw["write_bytes"] = val
+					}
+				}
+			}
+		}
+	}
+
+	// /proc/pid/fd — fds (count open file descriptors; requires process ownership or root)
+	if hasMetric("fds") {
+		entries, err := ioutil.ReadDir(fmt.Sprintf("/proc/%d/fd", pid))
+		if err == nil {
+			values["fds"] = int64(len(entries))
+		}
+	}
+
+	// /proc/pid/status — ctx_switch (voluntary + involuntary context switches)
+	if hasMetric("ctx_switch") {
+		dat, err := ioutil.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
+		if err == nil {
+			var vol, nvol int64
+			for _, line := range strings.Split(string(dat), "\n") {
+				f := strings.Fields(line)
+				if len(f) < 2 {
+					continue
+				}
+				switch f[0] {
+				case "voluntary_ctxt_switches:":
+					vol, _ = strconv.ParseInt(f[1], 10, 64)
+				case "nonvoluntary_ctxt_switches:":
+					nvol, _ = strconv.ParseInt(f[1], 10, 64)
+				}
+			}
+			raw := vol + nvol
+			if initialized {
+				values["ctx_switch"] = raw - prevRaw["ctx_switch"]
+			}
+			newRaw["ctx_switch"] = raw
+		}
+	}
 
 	pst.mu.Lock()
-	var cpuDelta int
-	if pst.initialized {
-		cpuDelta = totalCPU - pst.prevCPU
+	for k, v := range newRaw {
+		pst.prevRaw[k] = v
 	}
-	pst.prevCPU = totalCPU
 	pst.initialized = true
-	pst.samples = append(pst.samples, Sample{
-		Timestamp: ts,
-		CPU:       cpuDelta,
-		VSize:     vsize,
-		RSS:       rss,
-	})
+	pst.samples = append(pst.samples, Sample{Timestamp: ts, Values: values})
 	if len(pst.samples) > maxSamples {
 		pst.samples = pst.samples[len(pst.samples)-maxSamples:]
 	}
@@ -105,7 +212,7 @@ func collectOnce(name string, pst *ProcessStats) {
 func startCollector(names []string) {
 	statsMapMu.Lock()
 	for _, name := range names {
-		statsMap[name] = &ProcessStats{}
+		statsMap[name] = &ProcessStats{prevRaw: make(map[string]int64)}
 	}
 	statsMapMu.Unlock()
 
@@ -136,7 +243,8 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(result)
 }
 
-const htmlPage = `<!DOCTYPE html>
+// __METRICS__ is replaced at request time with the JSON array of selected metric names.
+const htmlTemplate = `<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
@@ -154,17 +262,23 @@ const htmlPage = `<!DOCTYPE html>
 </head>
 <body>
   <h1>Process Monitor</h1>
-  <div class="charts">
-    <div class="card">
-      <h2>CPU (ticks/sec)</h2>
-      <canvas id="cpuChart"></canvas>
-    </div>
-    <div class="card">
-      <h2>Memory RSS (pages)</h2>
-      <canvas id="rssChart"></canvas>
-    </div>
-  </div>
+  <div class="charts" id="charts"></div>
   <script>
+    const METRICS = __METRICS__;
+
+    const METRIC_LABELS = {
+      cpu:         'CPU (ticks/sec)',
+      rss:         'RSS Memory (pages)',
+      vsize:       'Virtual Memory (pages)',
+      threads:     'Thread Count',
+      fds:         'Open File Descriptors',
+      read_bytes:  'Disk Read (bytes/sec)',
+      write_bytes: 'Disk Write (bytes/sec)',
+      minflt:      'Minor Page Faults/sec',
+      majflt:      'Major Page Faults/sec',
+      ctx_switch:  'Context Switches/sec',
+    };
+
     const PALETTE = ['#4dc9f6','#f67019','#f53794','#acc236','#166a8f','#00a950','#58595b'];
 
     function makeChart(id) {
@@ -192,8 +306,16 @@ const htmlPage = `<!DOCTYPE html>
       });
     }
 
-    const cpuChart = makeChart('cpuChart');
-    const rssChart = makeChart('rssChart');
+    // Dynamically create a card + canvas for each metric.
+    const chartsDiv = document.getElementById('charts');
+    const charts = {};
+    METRICS.forEach(metric => {
+      const card = document.createElement('div');
+      card.className = 'card';
+      card.innerHTML = '<h2>' + (METRIC_LABELS[metric] || metric) + '</h2><canvas id="chart_' + metric + '"></canvas>';
+      chartsDiv.appendChild(card);
+      charts[metric] = makeChart('chart_' + metric);
+    });
 
     let knownProcesses = [];
 
@@ -201,8 +323,13 @@ const htmlPage = `<!DOCTYPE html>
       processes.forEach((name, i) => {
         if (knownProcesses.indexOf(name) === -1) {
           const color = PALETTE[i % PALETTE.length];
-          cpuChart.data.datasets.push({ label: name, data: [], borderColor: color, backgroundColor: color + '33', fill: false, tension: 0.2, pointRadius: 2 });
-          rssChart.data.datasets.push({ label: name, data: [], borderColor: color, backgroundColor: color + '33', fill: false, tension: 0.2, pointRadius: 2 });
+          METRICS.forEach(metric => {
+            charts[metric].data.datasets.push({
+              label: name, data: [],
+              borderColor: color, backgroundColor: color + '33',
+              fill: false, tension: 0.2, pointRadius: 2
+            });
+          });
           knownProcesses.push(name);
         }
       });
@@ -218,14 +345,14 @@ const htmlPage = `<!DOCTYPE html>
 
         knownProcesses.forEach((name, i) => {
           const samples = data[name] || [];
-          const cpuPts = samples.map(s => ({ x: (s.t - now) / 1000, y: s.cpu }));
-          const rssPts = samples.map(s => ({ x: (s.t - now) / 1000, y: s.rss }));
-          cpuChart.data.datasets[i].data = cpuPts;
-          rssChart.data.datasets[i].data = rssPts;
+          METRICS.forEach(metric => {
+            charts[metric].data.datasets[i].data = samples.map(s => ({
+              x: (s.t - now) / 1000,
+              y: (s.m && s.m[metric] !== undefined) ? s.m[metric] : null
+            }));
+            charts[metric].update();
+          });
         });
-
-        cpuChart.update();
-        rssChart.update();
       } catch (e) {
         console.error('poll error:', e);
       }
@@ -238,12 +365,26 @@ const htmlPage = `<!DOCTYPE html>
 </html>`
 
 func mainPageHandler(w http.ResponseWriter, r *http.Request) {
+	metricsJSON, _ := json.Marshal(selectedMetrics)
+	page := strings.Replace(htmlTemplate, "__METRICS__", string(metricsJSON), 1)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprint(w, htmlPage)
+	fmt.Fprint(w, page)
 }
 
 func main() {
 	processesFlag := flag.String("processes", "python2", "Comma-separated list of process names to monitor.")
+	metricsFlag := flag.String("metrics", "cpu,rss", `Comma-separated list of metrics to display.
+Available metrics:
+  cpu         CPU usage (ticks/sec)                      /proc/<pid>/stat
+  rss         Resident set size (memory pages)           /proc/<pid>/statm
+  vsize       Virtual memory size (pages)                /proc/<pid>/statm
+  threads     Number of threads                          /proc/<pid>/stat
+  fds         Open file descriptor count                 /proc/<pid>/fd/
+  read_bytes  Storage bytes read per second              /proc/<pid>/io  (requires ownership)
+  write_bytes Storage bytes written per second           /proc/<pid>/io  (requires ownership)
+  minflt      Minor page faults per second               /proc/<pid>/stat
+  majflt      Major page faults per second               /proc/<pid>/stat
+  ctx_switch  Context switches per second                /proc/<pid>/status`)
 	flag.Parse()
 
 	names := strings.Split(*processesFlag, ",")
@@ -251,11 +392,20 @@ func main() {
 		names[i] = strings.TrimSpace(n)
 	}
 
+	selectedMetrics = strings.Split(*metricsFlag, ",")
+	for i, m := range selectedMetrics {
+		selectedMetrics[i] = strings.TrimSpace(m)
+	}
+	metricsSet = make(map[string]bool)
+	for _, m := range selectedMetrics {
+		metricsSet[m] = true
+	}
+
 	startCollector(names)
 
 	http.HandleFunc("/", mainPageHandler)
 	http.HandleFunc("/metrics", metricsHandler)
 
-	fmt.Printf("Monitoring: %v\nListening on http://localhost:8090\n", names)
+	fmt.Printf("Monitoring: %v\nMetrics:    %v\nListening on http://localhost:8090\n", names, selectedMetrics)
 	http.ListenAndServe(":8090", nil)
 }
